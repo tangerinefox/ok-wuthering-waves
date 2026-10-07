@@ -39,6 +39,13 @@ except ImportError:
     print('缺少依赖，先装：pip install pynput')
     sys.exit(1)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from screen_sampler import ScreenSampler
+    SAMPLER_AVAILABLE = True
+except Exception:
+    SAMPLER_AVAILABLE = False
+
 #: 停止热键
 STOP_KEY = 'f10'
 #: 倒计时秒数
@@ -79,6 +86,22 @@ class InputRecorder:
         with self._lock:
             self.events.clear()
         self._t0 = None
+
+    def clock(self) -> float:
+        """当前时刻（相对录制起点）。
+
+        屏幕采样器必须用**同一个时钟**，否则两边的秒数各算各的，
+        合起来看就完全对不上。
+        """
+        return self._stamp()
+
+    def absorb(self, events: list[dict]) -> None:
+        """把另一个来源的事件并进同一条流，按时间排好序。"""
+        if not events:
+            return
+        with self._lock:
+            self.events.extend(events)
+            self.events.sort(key=lambda e: e['t'])
 
     def _stamp(self) -> float:
         now = time.perf_counter()
@@ -145,6 +168,7 @@ class RecorderApp:
 
         self.key_listener = None
         self.mouse_listener = None
+        self.sampler = None
         self.state = 'idle'
         self._saved_path: Path | None = None
         self._drag = (0, 0)
@@ -172,10 +196,19 @@ class RecorderApp:
         tk.Label(self.root, text='录一段真实操作，用来量连招的时序',
                  bg=BG_IDLE, fg=FG_DIM, font=('Microsoft YaHei UI', 9)).pack()
 
+        self.sample_var = tk.BooleanVar(value=SAMPLER_AVAILABLE)
+        tk.Checkbutton(self.root,
+                       text='同时采样屏幕状态（记录 buff / 图标变化）',
+                       variable=self.sample_var, bg=BG_IDLE, fg=FG_DIM,
+                       selectcolor=BG_IDLE, activebackground=BG_IDLE,
+                       activeforeground=FG, font=('Microsoft YaHei UI', 9),
+                       state='normal' if SAMPLER_AVAILABLE else 'disabled',
+                       cursor='hand2').pack()
+
         tk.Button(self.root, text='开始录制', command=self._start_countdown,
                   bg=ACCENT, fg='#0b0d10', activebackground='#aecbfa',
                   font=('Microsoft YaHei UI', 12, 'bold'), relief='flat',
-                  padx=28, pady=10, cursor='hand2').pack(pady=22)
+                  padx=28, pady=10, cursor='hand2').pack(pady=14)
 
         if self._saved_path:
             tk.Label(self.root, text=f'上次保存：{self._saved_path.name}',
@@ -233,6 +266,29 @@ class RecorderApp:
         self.state = 'recording'
         self._build_overlay()
         self._start_listeners()
+        self._start_sampling()
+
+    def _start_sampling(self) -> None:
+        """按勾选启动屏幕采样，跟键鼠共用同一个时钟。"""
+        if not (SAMPLER_AVAILABLE and self.sample_var.get()):
+            return
+        config = Path(__file__).resolve().parent / 'sampler_regions.json'
+        if not config.exists():
+            print(f'没有采样配置：{config}')
+            return
+        try:
+            sampler = ScreenSampler.from_config(config, fps=10.0,
+                                                clock=self.recorder.clock)
+            # 宽高还是 0 的占位区域直接丢掉
+            sampler.regions = [r for r in sampler.regions if r.box[2] > 0 and r.box[3] > 0]
+            if not sampler.regions:
+                print('采样配置里都是占位区域，跳过屏幕采样')
+                return
+            sampler.start()
+            self.sampler = sampler
+            print(f'屏幕采样已启动：{sampler.describe()}')
+        except Exception as exc:
+            print(f'屏幕采样启动失败：{exc}')
 
     def _build_overlay(self) -> None:
         """置顶无边框悬浮条，可拖动。"""
@@ -322,6 +378,7 @@ class RecorderApp:
         self.root.after(150, self._do_save)
 
     def _do_save(self) -> None:
+        self._stop_sampling()
         count, seconds = self.recorder.snapshot()
         if count == 0:
             self._saved_path = None
@@ -329,6 +386,20 @@ class RecorderApp:
             return
         self._saved_path = self.recorder.save()
         self._build_done(seconds, count)
+
+    def _stop_sampling(self) -> None:
+        """停采样，把屏幕变化并进同一条事件流。"""
+        if self.sampler is None:
+            return
+        sampler, self.sampler = self.sampler, None
+        try:
+            sampler.stop()
+            screen_events = sampler.poll()
+            print(f'屏幕采样结束：采样 {sampler.sample_count} 次，'
+                  f'记录 {len(screen_events)} 次变化')
+            self.recorder.absorb(screen_events)
+        except Exception as exc:
+            print(f'停止采样出错：{exc}')
 
     def _build_done(self, seconds: float, count: int) -> None:
         for widget in self.root.winfo_children():
